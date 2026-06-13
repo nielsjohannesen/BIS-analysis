@@ -1,36 +1,43 @@
 """
 Build a bilateral panel dataset from BIS Locational Banking Statistics.
 
-Filters:
-  - Position: liabilities (BALANCE_SHEET_POSITION = L)
-  - Counterpart sector: non-bank (COUNTERPART_SECTOR = N)
-  - Currency: all currencies, USD-converted (CURRENCY = TO1)
-  - Instrument: all (TYPE_INSTRUMENT = A)
-  - Remaining maturity: all (REM_MATURITY = A)
-  - Measure: amounts outstanding / stocks (MEASURE = B)
+Source file: data/WS_LBS_D_PUB_csv_col.csv
 
-Output columns:
-  bank_country      | reporting bank country name
-  bank_iso          | reporting country ISO 2-letter code
-  counterpart_country | counterpart country name
-  counterpart_iso   | counterpart country ISO 2-letter code
-  quarter           | e.g. "2023-Q4"
-  amount_usd        | USD millions (as reported by BIS)
+The BIS CSV has paired code+label columns for each dimension, followed by
+one column per quarter (e.g. "1977-Q4", "1978-Q1", …).
+
+Filters applied:
+  L_MEASURE   = S   → Amounts outstanding / Stocks
+  L_POSITION  = L   → Total liabilities
+  L_INSTR     = A   → All instruments
+  L_DENOM     = TO1 → All currencies, USD-converted
+  L_CURR_TYPE = A   → All currencies
+  L_PARENT_CTY= 5J  → All countries (parent)
+  L_REP_BANK_TYPE = A → All reporting institutions
+  L_CP_SECTOR = N   → Non-banks, total
+  L_POS_TYPE  = N   → Cross-border positions
 
 Country filtering:
-  Keep only true country observations (2-letter ISO-style codes).
-  Drop regional aggregates (Africa, Offshore centres, etc.).
-  Exception: keep BIS code "1W" (World) as counterpart_iso = "WLD".
+  L_REP_CTY   : keep 2-letter ISO codes only (actual bank countries)
+  L_CP_COUNTRY: keep 2-letter ISO codes + "5J" (All countries = World)
+
+Output columns:
+  bank_country        reporting bank country name
+  bank_iso            reporting country ISO 2-letter code
+  counterpart_country counterpart country name
+  counterpart_iso     counterpart country ISO 2-letter code (or "WLD" for world)
+  quarter             e.g. "2023-Q4"
+  amount_usd          USD millions (stocks, as reported by BIS)
 
 Outputs:
   output/lbs_bilateral_panel.csv
   output/lbs_bilateral_panel.dta  (Stata 14 format)
 """
 
+import re
 from pathlib import Path
 
 import pandas as pd
-import pycountry
 import pyreadstat
 
 # ---------------------------------------------------------------------------
@@ -38,166 +45,140 @@ import pyreadstat
 # ---------------------------------------------------------------------------
 
 ROOT = Path(__file__).parent.parent
-DATA_FILE = ROOT / "data" / "LBS_D_PUB.csv"
+DATA_FILE = ROOT / "data" / "WS_LBS_D_PUB_csv_col.csv"
 OUT_DIR = ROOT / "output"
 OUT_CSV = OUT_DIR / "lbs_bilateral_panel.csv"
 OUT_DTA = OUT_DIR / "lbs_bilateral_panel.dta"
 
 # ---------------------------------------------------------------------------
-# BIS dimension column names (column-format CSV)
-# These are the header names used in the BIS bulk CSV.
-# Adjust if the file uses slightly different names.
+# Column names in the BIS CSV
+# Each dimension has a code column and a label column side-by-side.
 # ---------------------------------------------------------------------------
 
-DIM_FREQ = "FREQ"
-DIM_MEASURE = "MEASURE"
-DIM_POSITION = "BALANCE_SHEET_POSITION"
-DIM_PARENT = "PARENT_CTY"
-DIM_CURRENCY = "CURRENCY"
-DIM_REP_CTY = "REP_CTY"          # reporting / bank country
-DIM_SECTOR = "COUNTERPART_SECTOR"
-DIM_CTR_AREA = "COUNTERPART_AREA"
-DIM_INSTRUMENT = "TYPE_INSTRUMENT"
-DIM_MATURITY = "REM_MATURITY"
+COL_MEASURE      = "L_MEASURE"
+COL_POSITION     = "L_POSITION"
+COL_INSTR        = "L_INSTR"
+COL_DENOM        = "L_DENOM"
+COL_CURR_TYPE    = "L_CURR_TYPE"
+COL_PARENT_CTY   = "L_PARENT_CTY"
+COL_REP_BANK_TYPE= "L_REP_BANK_TYPE"
+COL_REP_CTY      = "L_REP_CTY"        # bank / reporting country (code)
+COL_REP_CTY_LBL  = "Reporting country" # bank country name
+COL_CP_SECTOR    = "L_CP_SECTOR"
+COL_CP_COUNTRY   = "L_CP_COUNTRY"     # counterpart country (code)
+COL_CP_CTY_LBL   = "Counterparty country"  # counterpart country name
+COL_POS_TYPE     = "L_POS_TYPE"
 
-# Target filter values
+# Dimension filter values
 FILTERS = {
-    DIM_FREQ: "Q",
-    DIM_MEASURE: "B",
-    DIM_POSITION: "L",
-    DIM_CURRENCY: "TO1",
-    DIM_INSTRUMENT: "A",
-    DIM_MATURITY: "A",
-    DIM_SECTOR: "N",
+    COL_MEASURE:       "S",
+    COL_POSITION:      "L",
+    COL_INSTR:         "A",
+    COL_DENOM:         "TO1",
+    COL_CURR_TYPE:     "A",
+    COL_PARENT_CTY:    "5J",
+    COL_REP_BANK_TYPE: "A",
+    COL_CP_SECTOR:     "N",
+    COL_POS_TYPE:      "N",
 }
 
-# BIS "World" aggregate code → we map it to iso "WLD"
-BIS_WORLD_CODE = "1W"
+# BIS aggregate code for "All countries" kept as World counterpart
+WORLD_CODE = "5J"
+WORLD_ISO  = "WLD"
 WORLD_NAME = "World"
 
+# Regex for valid quarter column names
+QUARTER_RE = re.compile(r"^\d{4}-Q[1-4]$")
+
+
 # ---------------------------------------------------------------------------
-# Country helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def build_iso_lookup() -> dict[str, str]:
-    """Return {iso2_code: country_name} for all ISO 3166-1 alpha-2 countries."""
-    return {c.alpha_2: c.name for c in pycountry.countries}
+def is_iso2(code: str) -> bool:
+    """True for 2-letter uppercase codes (ISO 3166-1 alpha-2 style)."""
+    return bool(re.match(r"^[A-Z]{2}$", code))
 
 
-def is_country_code(code: str, iso_lookup: dict) -> bool:
-    """True if code is a 2-letter ISO country code or our World sentinel."""
-    return code in iso_lookup or code == BIS_WORLD_CODE
-
-
-def label_country(code: str, iso_lookup: dict) -> tuple[str, str]:
-    """Return (name, iso) for a BIS country code."""
-    if code == BIS_WORLD_CODE:
-        return WORLD_NAME, "WLD"
-    name = iso_lookup.get(code, code)   # fall back to code if unknown
+def normalise_counterpart(code: str, name: str) -> tuple[str, str]:
+    if code == WORLD_CODE:
+        return WORLD_NAME, WORLD_ISO
     return name, code
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main pipeline
 # ---------------------------------------------------------------------------
 
 def load_raw(path: Path) -> pd.DataFrame:
-    print(f"Loading raw data from: {path}")
-    # BIS CSVs often have a multi-line header; skip rows until we hit the
-    # dimension columns. We detect the header by looking for the FREQ column.
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f):
-            if DIM_FREQ in line:
-                header_row = i
-                break
-        else:
-            raise RuntimeError(
-                f"Could not find header row containing '{DIM_FREQ}' in {path}.\n"
-                "Check that the file is the BIS LBS column-format CSV."
-            )
-
-    df = pd.read_csv(path, skiprows=header_row, low_memory=False)
-    print(f"  Raw shape: {df.shape}")
+    print(f"Loading: {path}")
+    df = pd.read_csv(path, low_memory=False)
+    print(f"  Shape: {df.shape}")
     return df
 
 
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    print("Applying dimension filters …")
+    print("Applying filters …")
     mask = pd.Series(True, index=df.index)
     for col, val in FILTERS.items():
         if col not in df.columns:
             raise KeyError(
-                f"Expected dimension column '{col}' not found.\n"
-                f"Available columns: {list(df.columns[:30])}"
+                f"Column '{col}' not found. "
+                f"Available: {[c for c in df.columns if not c.startswith('19') and not c.startswith('20')]}"
             )
         mask &= df[col].astype(str).str.strip() == val
-    filtered = df[mask].copy()
-    print(f"  Rows after filtering: {len(filtered):,}")
-    return filtered
+    out = df[mask].copy()
+    print(f"  Rows after filtering: {len(out):,}")
+    return out
+
+
+def filter_countries(df: pd.DataFrame) -> pd.DataFrame:
+    print("Filtering country codes …")
+    # Bank country: ISO 2-letter only
+    rep_ok = df[COL_REP_CTY].astype(str).str.strip().apply(is_iso2)
+    # Counterpart: ISO 2-letter OR the World aggregate (5J)
+    ctr_ok = df[COL_CP_COUNTRY].astype(str).str.strip().apply(
+        lambda c: is_iso2(c) or c == WORLD_CODE
+    )
+    out = df[rep_ok & ctr_ok].copy()
+    print(f"  Rows after country filtering: {len(out):,}")
+    return out
 
 
 def melt_to_long(df: pd.DataFrame) -> pd.DataFrame:
-    """Pivot from wide (one column per quarter) to long format."""
     print("Melting to long format …")
-    dim_cols = [
-        DIM_FREQ, DIM_MEASURE, DIM_POSITION, DIM_PARENT,
-        DIM_CURRENCY, DIM_REP_CTY, DIM_SECTOR, DIM_CTR_AREA,
-        DIM_INSTRUMENT, DIM_MATURITY,
-    ]
-    # Time columns look like "2000-Q1", "2000-Q2", …
-    time_cols = [c for c in df.columns if c not in dim_cols and "Q" in str(c)]
+    time_cols = [c for c in df.columns if QUARTER_RE.match(str(c))]
     if not time_cols:
-        raise RuntimeError(
-            "No quarter columns found (expected format: '2000-Q1').\n"
-            f"Non-dimension columns: {[c for c in df.columns if c not in dim_cols][:20]}"
-        )
+        raise RuntimeError("No quarter columns found (expected format: '2000-Q1').")
 
-    id_cols = [c for c in dim_cols if c in df.columns]
-    long = df[id_cols + time_cols].melt(
-        id_vars=id_cols,
-        value_vars=time_cols,
-        var_name="quarter",
-        value_name="amount_usd",
+    id_cols = [COL_REP_CTY, COL_REP_CTY_LBL, COL_CP_COUNTRY, COL_CP_CTY_LBL]
+    long = (
+        df[id_cols + time_cols]
+        .melt(id_vars=id_cols, value_vars=time_cols,
+              var_name="quarter", value_name="amount_usd")
     )
-    # Drop missing observations
-    long = long.dropna(subset=["amount_usd"])
-    long = long[long["amount_usd"].astype(str).str.strip() != ""]
     long["amount_usd"] = pd.to_numeric(long["amount_usd"], errors="coerce")
-    long = long.dropna(subset=["amount_usd"])
+    long = long.dropna(subset=["amount_usd"]).reset_index(drop=True)
     print(f"  Observations after melting: {len(long):,}")
     return long
 
 
-def filter_countries(df: pd.DataFrame, iso_lookup: dict) -> pd.DataFrame:
-    """Drop regional aggregates; keep true countries + World."""
-    print("Filtering country codes …")
-    rep_ok = df[DIM_REP_CTY].apply(lambda c: is_country_code(str(c).strip(), iso_lookup))
-    ctr_ok = df[DIM_CTR_AREA].apply(lambda c: is_country_code(str(c).strip(), iso_lookup))
-    out = df[rep_ok & ctr_ok].copy()
-    print(f"  Observations after country filtering: {len(out):,}")
-    return out
+def build_output(df: pd.DataFrame) -> pd.DataFrame:
+    rep_codes  = df[COL_REP_CTY].astype(str).str.strip()
+    rep_names  = df[COL_REP_CTY_LBL].astype(str).str.strip()
+    ctr_codes  = df[COL_CP_COUNTRY].astype(str).str.strip()
+    ctr_names  = df[COL_CP_CTY_LBL].astype(str).str.strip()
 
-
-def build_output(df: pd.DataFrame, iso_lookup: dict) -> pd.DataFrame:
-    """Construct the final panel with clean column names."""
-    df = df.copy()
-
-    bank_labels = df[DIM_REP_CTY].apply(
-        lambda c: pd.Series(label_country(str(c).strip(), iso_lookup),
-                            index=["bank_country", "bank_iso"])
-    )
-    ctr_labels = df[DIM_CTR_AREA].apply(
-        lambda c: pd.Series(label_country(str(c).strip(), iso_lookup),
-                            index=["counterpart_country", "counterpart_iso"])
-    )
+    ctr_mapped = [normalise_counterpart(c, n) for c, n in zip(ctr_codes, ctr_names)]
+    ctr_name_out, ctr_iso_out = zip(*ctr_mapped)
 
     panel = pd.DataFrame({
-        "bank_country": bank_labels["bank_country"].values,
-        "bank_iso": bank_labels["bank_iso"].values,
-        "counterpart_country": ctr_labels["counterpart_country"].values,
-        "counterpart_iso": ctr_labels["counterpart_iso"].values,
-        "quarter": df["quarter"].values,
-        "amount_usd": df["amount_usd"].values,
+        "bank_country":        rep_names.values,
+        "bank_iso":            rep_codes.values,
+        "counterpart_country": list(ctr_name_out),
+        "counterpart_iso":     list(ctr_iso_out),
+        "quarter":             df["quarter"].values,
+        "amount_usd":          df["amount_usd"].values,
     })
 
     panel = panel.sort_values(
@@ -210,26 +191,27 @@ def build_output(df: pd.DataFrame, iso_lookup: dict) -> pd.DataFrame:
 def save_outputs(panel: pd.DataFrame) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Saving CSV  → {OUT_CSV}")
+    print(f"Saving CSV   → {OUT_CSV}")
     panel.to_csv(OUT_CSV, index=False)
 
     print(f"Saving Stata → {OUT_DTA}")
     pyreadstat.write_dta(panel, OUT_DTA, version=14)
 
-    print(f"\nDone. Final panel: {len(panel):,} observations, "
-          f"{panel['bank_iso'].nunique()} bank countries, "
-          f"{panel['counterpart_iso'].nunique()} counterpart countries, "
-          f"{panel['quarter'].nunique()} quarters.")
+    print(
+        f"\nDone. "
+        f"{len(panel):,} observations | "
+        f"{panel['bank_iso'].nunique()} bank countries | "
+        f"{panel['counterpart_iso'].nunique()} counterpart countries | "
+        f"{panel['quarter'].nunique()} quarters"
+    )
 
 
 def main() -> None:
-    iso_lookup = build_iso_lookup()
-
-    raw = load_raw(DATA_FILE)
+    raw      = load_raw(DATA_FILE)
     filtered = apply_filters(raw)
-    long = melt_to_long(filtered)
-    countries = filter_countries(long, iso_lookup)
-    panel = build_output(countries, iso_lookup)
+    countries= filter_countries(filtered)
+    long     = melt_to_long(countries)
+    panel    = build_output(long)
     save_outputs(panel)
 
 
