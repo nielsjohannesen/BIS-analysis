@@ -1,0 +1,4 @@
+pandas>=2.0
+requests>=2.31
+pycountry>=23.12
+pyreadstat>=1.2
