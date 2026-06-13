@@ -20,7 +20,7 @@ Output columns:
 Country filtering:
   Keep only true country observations (2-letter ISO-style codes).
   Drop regional aggregates (Africa, Offshore centres, etc.).
-  Exception: keep BIS code "1W" (World) as counterpart_iso = "WLD".
+  Exception: keep BIS code "5J" (All countries / World) as counterpart_iso = "WLD".
 
 Outputs:
   output/lbs_bilateral_panel.csv
@@ -71,8 +71,8 @@ FILTERS = {
     DIM_SECTOR: "N",
 }
 
-# BIS "World" aggregate code → we map it to iso "WLD"
-BIS_WORLD_CODE = "1W"
+# BIS aggregate code for "All countries" (World) → map to iso "WLD"
+BIS_WORLD_CODE = "5J"
 WORLD_NAME = "World"
 
 # ---------------------------------------------------------------------------
